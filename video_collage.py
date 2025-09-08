@@ -296,6 +296,7 @@ def run_ffmpeg_grid(paths: List[str], rows: int, cols: int, target_h: int, out_f
 
 def make_collage_video(*args, **kwargs):
     # Backward compat placeholder; not used in ffmpeg path
+    pass
 
 
 # ---------- Main ----------

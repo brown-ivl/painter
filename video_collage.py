@@ -33,6 +33,7 @@ from moviepy.editor import (  # type: ignore
     VideoFileClip,
     CompositeAudioClip,
     concatenate_audioclips,
+    concatenate_videoclips,
     AudioFileClip,
     afx,
     clips_array,
@@ -87,7 +88,7 @@ class CollageConfig:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Random video collage builder")
-    p.add_argument("inputs", nargs="+", help="Input video files or directories")
+    p.add_argument("--inputs", nargs="+", help="Input video files or directories")
     p.add_argument("-n", "--num", type=int, required=True, help="Number of videos to select")
     p.add_argument("--recursive", action="store_true", help="Recurse into directories")
     p.add_argument("--cols", type=int, default=3, help="Number of columns in grid")
@@ -130,13 +131,15 @@ def load_and_prepare_clip(path: str, target_h: int, duration: Optional[float]) -
         if clip.duration > duration:
             clip = clip.subclip(0, duration)
         elif clip.duration < duration:
-            # pad by freezing last frame
-            freeze_time = clip.duration
-            freeze_clip = clip.to_ImageClip(t=freeze_time - 1e-3).set_duration(duration - freeze_time)
-            clip = concatenate_audioclips([clip, freeze_clip]) if clip.audio else clip.set_duration(duration)
-            # Simpler: just set duration w/out audio extend if silent
-            if clip.audio is None:
-                clip = clip.set_duration(duration)
+            # pad by freezing last frame (create an ImageClip of the last frame)
+            freeze_time = max(0.0, clip.duration - 1e-3)
+            freeze_v = clip.to_ImageClip(t=freeze_time).set_duration(duration - clip.duration)
+            # Keep FPS consistent for smoother concat
+            try:
+                freeze_v = freeze_v.set_fps(clip.fps)
+            except Exception:
+                pass
+            clip = concatenate_videoclips([clip, freeze_v])
     return clip
 
 
@@ -179,7 +182,35 @@ def build_grid(clips: List[VideoFileClip], rows: int, cols: int):
     return clips_array(grid)
 
 
+def ensure_ffmpeg(prefer_imageio: bool = True) -> None:
+    """Ensure a recent ffmpeg binary is used.
+
+    If prefer_imageio is True and imageio-ffmpeg is available, point MoviePy/ImageIO
+    to that binary to avoid distro-provided outdated ffmpeg.
+    """
+    if not prefer_imageio:
+        return
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        # For imageio-ffmpeg consumers
+        os.environ.setdefault("IMAGEIO_FFMPEG_EXE", ffmpeg_exe)
+        # For moviepy (older versions read config setting)
+        try:
+            from moviepy.config import change_settings  # type: ignore
+
+            change_settings({"FFMPEG_BINARY": ffmpeg_exe})
+        except Exception:
+            pass
+    except Exception:
+        # imageio-ffmpeg not available: will fall back to system ffmpeg
+        pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Prefer a recent ffmpeg to avoid first-frame decode errors
+    ensure_ffmpeg(prefer_imageio=True)
     args = parse_args(argv)
 
     all_videos = find_videos(args.inputs, recursive=args.recursive)
@@ -205,13 +236,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     prepared: List[VideoFileClip] = []
-    for p in chosen:
+    tried: set[str] = set()
+
+    def try_load(path: str) -> Optional[VideoFileClip]:
+        tried.add(path)
         try:
-            clip = load_and_prepare_clip(p, cfg.resize_height, cfg.duration)
+            return load_and_prepare_clip(path, cfg.resize_height, cfg.duration)
         except Exception as e:
-            print(f"[WARN] Skipping {p}: {e}")
-            continue
-        prepared.append(clip)
+            print(f"[WARN] Skipping {path}: {e}")
+            return None
+
+    for p in chosen:
+        clip = try_load(p)
+        if clip is not None:
+            prepared.append(clip)
+
+    # If we didn't reach desired count due to unreadable files, pull more from the pool
+    if len(prepared) < cfg.num:
+        remaining = [p for p in all_videos if p not in tried]
+        if cfg.seed is not None:
+            random.seed(cfg.seed + 1)
+        random.shuffle(remaining)
+        for p in remaining:
+            if len(prepared) >= cfg.num:
+                break
+            clip = try_load(p)
+            if clip is not None:
+                prepared.append(clip)
     if not prepared:
         print("No clips loaded", file=sys.stderr)
         return 4
@@ -226,7 +277,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         grid_clip = grid_clip.set_audio(None)
 
-    out_fps = cfg.fps or prepared[0].fps
+    try:
+        base_fps = getattr(prepared[0], "fps", None)
+    except Exception:
+        base_fps = None
+    out_fps = cfg.fps or (base_fps if isinstance(base_fps, (int, float)) and base_fps > 0 else 24)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
     print(f"Writing collage to {args.out} ({rows}x{cols} grid, fps={out_fps})")

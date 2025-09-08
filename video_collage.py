@@ -40,10 +40,10 @@ import os
 import random
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
-
-import cv2
-import numpy as np
+from typing import List, Optional, Sequence, Tuple, Dict, Any
+import json
+import shlex
+import subprocess
 
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm", ".wmv", ".flv")
 
@@ -133,115 +133,169 @@ def compute_grid(n: int, cols: int) -> Tuple[int, int]:
     return rows, cols
 
 
-# ---------- Video I/O ----------
+# ---------- Probing and ffmpeg-based pipeline ----------
 
-def load_and_prepare_clip_cv2(path: str, target_h: int, duration: Optional[float]) -> Tuple[list, float, int, int, float]:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {path}")
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps < 1:
-        fps = 24.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frames = []
-    max_frames = total_frames
-    if duration is not None:
-        max_frames = int(round(fps * duration))
-    while len(frames) < max_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if target_h > 0 and frame.shape[0] != target_h:
-            aspect = frame.shape[1] / frame.shape[0]
-            new_w = int(round(target_h * aspect))
-            frame = cv2.resize(frame, (new_w, target_h))
-        frames.append(frame)
-    cap.release()
-    if duration is not None and len(frames) < max_frames and frames:
-        last = frames[-1]
-        while len(frames) < max_frames:
-            frames.append(last.copy())
-    if frames:
-        h, w = frames[0].shape[:2]
+def _run(cmd: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True)
+
+
+def ffprobe_video(path: str) -> Optional[Dict[str, Any]]:
+    """Return width, height, duration (float), and avg_frame_rate for the first video stream."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,avg_frame_rate:format=duration",
+        "-of", "json",
+        path,
+    ]
+    proc = _run(cmd)
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+        stream = (data.get("streams") or [{}])[0]
+        fmt = data.get("format", {})
+        w = int(stream.get("width") or 0)
+        h = int(stream.get("height") or 0)
+        afr = stream.get("avg_frame_rate") or "0/0"
+        # avg_frame_rate like '30000/1001'
+        try:
+            num, den = afr.split("/")
+            fps = float(num) / float(den) if float(den) != 0 else 0.0
+        except Exception:
+            fps = 0.0
+        try:
+            duration = float(fmt.get("duration") or 0.0)
+        except Exception:
+            duration = 0.0
+        if w <= 0 or h <= 0:
+            return None
+        return {"width": w, "height": h, "fps": fps, "duration": duration}
+    except Exception:
+        return None
+
+
+def even(x: int) -> int:
+    return x if x % 2 == 0 else x - 1
+
+
+def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, target_h: int, out_fps: int, duration: Optional[float], max_width: int) -> Tuple[str, Tuple[int, int]]:
+    """Build filter_complex for xstack grid and return (filter, (out_w, out_h))."""
+    # Compute scaled width per input and max column width
+    scaled_w = []
+    for m in meta_list:
+        w, h = int(m["width"]), int(m["height"])
+        sw = max(2, int(round(target_h * (w / h))))
+        sw = even(sw)
+        scaled_w.append(sw)
+    cell_w = max(scaled_w) if scaled_w else target_h
+    cell_h = even(target_h)
+    total = rows * cols
+
+    # Build per-input chains
+    parts: List[str] = []
+    labels: List[str] = []
+    d = duration if duration and duration > 0 else None
+    for i in range(len(meta_list)):
+        chain = f"[{i}:v:0]scale={scaled_w[i]}:{cell_h},pad={cell_w}:{cell_h}:(ow-iw)/2:0:black,setpts=PTS-STARTPTS"
+        if d is not None:
+            chain += f",tpad=stop_mode=clone:stop_duration={d},trim=duration={d},setpts=PTS-STARTPTS"
+        label = f"v{i}"
+        chain += f"[{label}]"
+        parts.append(chain)
+        labels.append(f"[{label}]")
+
+    # Add blanks if needed
+    blanks = total - len(meta_list)
+    # Choose blank duration
+    if d is not None:
+        d_blank = d
     else:
-        h, w = target_h, target_h
-    actual_duration = len(frames) / fps if fps else 0.0
-    return frames, float(fps), int(w), int(h), float(actual_duration)
+        # If no duration specified, use min duration among inputs (approx) so -shortest is okay
+        d_blank = max(1.0, min((m.get("duration") or 0.0) for m in meta_list) or 1.0)
+    for j in range(blanks):
+        label = f"b{j}"
+        parts.append(f"color=size={cell_w}x{cell_h}:color=black:rate={out_fps}:d={d_blank}[{label}]")
+        labels.append(f"[{label}]")
+
+    # xstack layout
+    layout_elems = []
+    for idx in range(total):
+        r = idx // cols
+        c = idx % cols
+        x = c * cell_w
+        y = r * cell_h
+        layout_elems.append(f"{x}_{y}")
+    shortest = 0 if d is not None else 1
+    layout = "|".join(layout_elems)
+    inputs_concat = "".join(labels)
+    xstack_out = "st"
+    parts.append(f"{inputs_concat}xstack=inputs={total}:layout={layout}:shortest={shortest}:fill=black[{xstack_out}]")
+
+    out_w = cell_w * cols
+    out_h = cell_h * rows
+    # Optional downscale
+    if max_width and out_w > max_width:
+        scale_h = even(int(round(out_h * (max_width / out_w))))
+        parts.append(f"[{xstack_out}]scale={even(max_width)}:{scale_h}[vout]")
+        out_w, out_h = even(max_width), scale_h
+        final_label = "[vout]"
+    else:
+        final_label = f"[{xstack_out}]"
+
+    filter_complex = ";".join(parts)
+    return filter_complex, (out_w, out_h)
+
+
+def run_ffmpeg_grid(paths: List[str], rows: int, cols: int, target_h: int, out_fps: int, duration: Optional[float], max_width: int, out_path: str) -> int:
+    # Probe all inputs
+    meta_list: List[Dict[str, Any]] = []
+    good_paths: List[str] = []
+    for p in paths:
+        m = ffprobe_video(p)
+        if m is None:
+            print(f"[WARN] Skipping (probe failed): {p}")
+            continue
+        meta_list.append(m)
+        good_paths.append(p)
+    if not meta_list:
+        print("No valid videos to process", file=sys.stderr)
+        return 4
+
+    # Build filter graph
+    filt, (out_w, out_h) = make_filter_complex(meta_list, rows, cols, target_h, out_fps, duration, max_width)
+
+    # Build command
+    cmd: List[str] = ["ffmpeg", "-y", "-hide_banner", "-stats", "-loglevel", "warning"]
+    for p in good_paths:
+        cmd += ["-i", p]
+    cmd += [
+        "-filter_complex", filt,
+        "-map", "[vout]" if "[vout]" in filt else "[st]",
+        "-r", str(out_fps),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-preset", "veryfast", "-crf", "23",
+        "-movflags", "+faststart",
+        out_path,
+    ]
+    print("Running:")
+    print(" ", " ".join(shlex.quote(x) for x in cmd))
+    # Stream output (progress)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            # ffmpeg prints progress lines; forward them
+            print(line.rstrip())
+    finally:
+        proc.wait()
+    return proc.returncode
 
 
 # ---------- Collage ----------
 
-def make_collage_video(video_frames_list, grid_shape, max_width=0, fps=24, out_path=None):
-    """Stream-build the collage and print progress.
-
-    video_frames_list: list[list[np.ndarray]] where each inner list are frames for one video
-    grid_shape: (nRows, nCols)
-    max_width: int, if >0, scale collage to this width
-    fps: output fps
-    out_path: path to write MP4; if None, only builds frames (not typical)
-    """
-    n_videos = len(video_frames_list)
-    nRows, nCols = grid_shape
-
-    # Determine frame count and truncate all videos to the shortest one
-    min_frames = min(len(frames) for frames in video_frames_list)
-    video_frames_list = [frames[:min_frames] for frames in video_frames_list]
-
-    # Normalize cell sizes: use target cell height from first frame, and max width across videos
-    cell_h = video_frames_list[0][0].shape[0]
-    cell_w = max(frames[0].shape[1] for frames in video_frames_list)
-
-    # Pad with black videos if needed to fill the grid
-    if n_videos < nRows * nCols:
-        blank = np.zeros((cell_h, cell_w, 3), dtype=video_frames_list[0][0].dtype)
-        for _ in range(nRows * nCols - n_videos):
-            video_frames_list.append([blank.copy() for _ in range(min_frames)])
-
-    # Precompute output size
-    collage_w = cell_w * nCols
-    collage_h = cell_h * nRows
-    out_w, out_h = collage_w, collage_h
-    if max_width > 0 and collage_w > max_width:
-        scale = max_width / float(collage_w)
-        out_w = max_width
-        out_h = int(round(collage_h * scale))
-
-    writer = None
-    if out_path:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
-
-    total = min_frames
-    last_pct = -1
-    print(f"Building collage: {nRows}x{nCols}, frames={total}, out={out_w}x{out_h}@{fps}")
-    for i in range(total):
-        # Assemble grid frame i
-        row_imgs = []
-        for r in range(nRows):
-            cells = []
-            for c in range(nCols):
-                idx = r * nCols + c
-                frame = video_frames_list[idx][i]
-                # Right-pad to cell_w if needed
-                fw = frame.shape[1]
-                if fw < cell_w:
-                    pad = cell_w - fw
-                    frame = cv2.copyMakeBorder(frame, 0, 0, 0, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0))
-                cells.append(frame)
-            row_imgs.append(np.hstack(cells))
-        collage = np.vstack(row_imgs)
-        if (out_w, out_h) != (collage.shape[1], collage.shape[0]):
-            collage = cv2.resize(collage, (out_w, out_h))
-        if writer is not None:
-            writer.write(collage)
-        # Progress: update every ~2% or 50 frames, whichever is less frequent
-        pct = int((i + 1) * 100 / total) if total else 100
-        if pct != last_pct and (pct % 2 == 0 or (i + 1) % 50 == 0 or (i + 1) == total):
-            print(f"\rProgress: {i + 1}/{total} ({pct}%)", end="", flush=True)
-            last_pct = pct
-    print()  # newline after progress
-    if writer is not None:
-        writer.release()
+def make_collage_video(*args, **kwargs):
+    # Backward compat placeholder; not used in ffmpeg path
 
 
 # ---------- Main ----------
@@ -270,47 +324,54 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         max_width=args.max_width,
     )
 
-    prepared: list = []
+    # Probe-first selection, skipping unreadables
+    prepared_paths: List[str] = []
     tried: set[str] = set()
 
-    def try_load(path: str):
+    def try_probe(path: str) -> bool:
         tried.add(path)
-        try:
-            frames, fps, w, h, actual_duration = load_and_prepare_clip_cv2(path, cfg.resize_height, cfg.duration)
-            return dict(frames=frames, fps=fps, w=w, h=h, duration=actual_duration)
-        except Exception as e:
-            print(f"[WARN] Skipping {path}: {e}")
-            return None
+        m = ffprobe_video(path)
+        if m is None:
+            print(f"[WARN] Skipping {path}: probe failed")
+            return False
+        return True
 
     for p in chosen:
-        clip = try_load(p)
-        if clip is not None:
-            prepared.append(clip)
+        if try_probe(p):
+            prepared_paths.append(p)
 
-    # If we didn't reach desired count due to unreadable files, pull more from the pool
-    if len(prepared) < cfg.num:
+    if len(prepared_paths) < cfg.num:
         remaining = [p for p in all_videos if p not in tried]
         if cfg.seed is not None:
             random.seed(cfg.seed + 1)
         random.shuffle(remaining)
         for p in remaining:
-            if len(prepared) >= cfg.num:
+            if len(prepared_paths) >= cfg.num:
                 break
-            clip = try_load(p)
-            if clip is not None:
-                prepared.append(clip)
-    if not prepared:
+            if try_probe(p):
+                prepared_paths.append(p)
+
+    if not prepared_paths:
         print("No clips loaded", file=sys.stderr)
         return 4
 
-    rows, cols = compute_grid(len(prepared), cfg.cols)
-    # Use the minimum fps of all videos for safety
-    out_fps = cfg.fps or min(int(round(c['fps'])) for c in prepared if c['fps'] > 0) or 24
+    rows, cols = compute_grid(len(prepared_paths), cfg.cols)
+    # Determine output FPS: min across inputs (fallback 24) if not provided
+    if cfg.fps is not None:
+        out_fps = int(cfg.fps)
+    else:
+        fps_vals: List[float] = []
+        for p in prepared_paths:
+            info = ffprobe_video(p)
+            if info and info.get("fps") and info["fps"] > 0:
+                fps_vals.append(float(info["fps"]))
+        out_fps = int(max(1, int(min(fps_vals) if fps_vals else 24)))
 
-    # Build the collage
-    video_frames_list = [c['frames'] for c in prepared]
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    make_collage_video(video_frames_list, (rows, cols), max_width=cfg.max_width, fps=out_fps, out_path=args.out)
+    rc = run_ffmpeg_grid(prepared_paths, rows, cols, cfg.resize_height, out_fps, cfg.duration, cfg.max_width, args.out)
+    if rc != 0:
+        print(f"ffmpeg failed with code {rc}", file=sys.stderr)
+        return rc
     print(f"Wrote collage to {args.out} ({rows}x{cols} grid, fps={out_fps})")
     return 0
 

@@ -111,3 +111,62 @@ Brightness is computed in [0,1]; pixels with brightness >= threshold are:
 
 Supports 8-bit and 16-bit inputs (alpha preserved). Grayscale inputs are handled.
 
+---
+
+## Video Collage (`video_collage.py`)
+
+Create a grid collage of randomly selected video clips.
+
+### Features
+* Recursive directory video discovery (mp4, mov, avi, mkv, m4v, webm, wmv, flv)
+* Random selection of N clips with optional seed and shuffle
+* Uniform height resize (keeps aspect ratio)
+* Trim or freeze-pad clips to common target duration
+* Configurable number of columns; rows inferred
+* Simple audio strategies: none (default), first clip audio, or naive mix
+* Output MP4 (H.264 + AAC)
+
+### Quick Examples
+
+Pick 9 random videos, 3 columns (=> 3x3 grid), resize each to 240px height:
+
+```bash
+python video_collage.py videos/ --recursive -n 9 --cols 3 --out collage.mp4
+```
+
+Short 5s collage of 8 clips, 4 columns, deterministic selection and keep first clip's audio:
+
+```bash
+python video_collage.py videos --recursive -n 8 --cols 4 --duration 5 --seed 123 --audio first --out collage_short.mp4
+```
+
+Mute output explicitly:
+
+```bash
+python video_collage.py videos -n 6 --cols 3 --mute --out silent.mp4
+```
+
+### Arguments
+
+```
+inputs         One or more video files or directories
+-n, --num      Number of videos to select (required)
+--recursive    Recurse into directories
+--cols         Number of columns in grid (default 3)
+--duration     Target duration seconds (trim longer; freeze last frame for shorter)
+--resize-height  Height for each clip (default 240)
+--seed         Random seed for reproducibility
+--audio        none | first | mix (default none)
+--mute         Force mute output (overrides --audio)
+--fps          Override output FPS (default: first loaded clip's fps)
+--shuffle      Shuffle candidate list prior to sampling (changes selection distribution)
+--out          Output video path (required)
+```
+
+### Notes
+* If `--num` exceeds available clips, all clips are used.
+* Grid is padded with black clips when needed to fill the last row.
+* Simple mix divides volume equally among contributing audio tracks.
+* For very large/high-res clips, consider lowering `--resize-height` to reduce memory usage.
+* Requires `moviepy` and an `ffmpeg` installation accessible in PATH.
+

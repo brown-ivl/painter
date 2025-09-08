@@ -91,7 +91,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--inputs", nargs="+", help="Input video files or directories")
     p.add_argument("-n", "--num", type=int, required=True, help="Number of videos to select")
     p.add_argument("--recursive", action="store_true", help="Recurse into directories")
-    p.add_argument("--cols", type=int, default=3, help="Number of columns in grid")
+    p.add_argument("--cols", type=int, default=0, help="Number of columns in grid (0=auto optimal)")
+    p.add_argument("--max-width", type=int, default=0, help="Max output width; scale down if exceeded (0=disable)")
     p.add_argument("--duration", type=float, default=None, help="Target duration seconds (trim or freeze)" )
     p.add_argument("--resize-height", type=int, default=240, help="Uniform height for each cell")
     p.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
@@ -117,7 +118,12 @@ def select_paths(all_paths: List[str], n: int, seed: Optional[int], shuffle_pool
 
 
 def compute_grid(n: int, cols: int) -> Tuple[int, int]:
-    cols = max(1, cols)
+    """Compute grid rows, cols.
+
+    If cols <= 0, choose an approximately square grid using ceil(sqrt(n)).
+    """
+    if cols is None or cols <= 0:
+        cols = max(1, math.ceil(math.sqrt(max(1, n))))
     rows = math.ceil(n / cols)
     return rows, cols
 
@@ -284,7 +290,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_fps = cfg.fps or (base_fps if isinstance(base_fps, (int, float)) and base_fps > 0 else 24)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
-    print(f"Writing collage to {args.out} ({rows}x{cols} grid, fps={out_fps})")
+    # Optionally scale final collage to a max width (preserving aspect)
+    if getattr(args, "max_width", 0) and grid_clip.w > args.max_width:
+        scale = args.max_width / float(grid_clip.w)
+        new_h = max(1, int(round(grid_clip.h * scale)))
+        grid_clip = grid_clip.resize(newsize=(args.max_width, new_h))
+
+    print(f"Writing collage to {args.out} ({rows}x{cols} grid, fps={out_fps}, size={grid_clip.w}x{grid_clip.h})")
     try:
         grid_clip.write_videofile(args.out, fps=out_fps, codec="libx264", audio_codec="aac")
     finally:

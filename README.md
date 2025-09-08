@@ -122,16 +122,17 @@ Create a grid collage of randomly selected video clips.
 * Random selection of N clips with optional seed and shuffle
 * Uniform height resize (keeps aspect ratio)
 * Trim or freeze-pad clips to common target duration
-* Configurable number of columns; rows inferred
+* Auto-optimal grid by default (square-ish); or set columns explicitly
+* Optional max output width with proportional downscale
 * Simple audio strategies: none (default), first clip audio, or naive mix
 * Output MP4 (H.264 + AAC)
 
 ### Quick Examples
 
-Pick 9 random videos, 3 columns (=> 3x3 grid), resize each to 240px height:
+Pick 9 random videos, auto-optimal grid (default), resize each to 240px height:
 
 ```bash
-python video_collage.py videos/ --recursive -n 9 --cols 3 --out collage.mp4
+python video_collage.py videos/ --recursive -n 9 --out collage.mp4
 ```
 
 Short 5s collage of 8 clips, 4 columns, deterministic selection and keep first clip's audio:
@@ -146,6 +147,12 @@ Mute output explicitly:
 python video_collage.py videos -n 6 --cols 3 --mute --out silent.mp4
 ```
 
+Limit final collage width to 1280px (keeps aspect ratio):
+
+```bash
+python video_collage.py videos -n 12 --max-width 1280 --out collage_1280.mp4
+```
+
 ### Arguments
 
 ```
@@ -153,6 +160,8 @@ inputs         One or more video files or directories
 -n, --num      Number of videos to select (required)
 --recursive    Recurse into directories
 --cols         Number of columns in grid (default 3)
+			   Set 0 for auto-optimal (square-ish) grid
+--max-width    Max output width; scale down if exceeded (0 disables)
 --duration     Target duration seconds (trim longer; freeze last frame for shorter)
 --resize-height  Height for each clip (default 240)
 --seed         Random seed for reproducibility

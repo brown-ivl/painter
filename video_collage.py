@@ -29,15 +29,8 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-from moviepy.editor import (  # type: ignore
-    VideoFileClip,
-    CompositeAudioClip,
-    concatenate_audioclips,
-    concatenate_videoclips,
-    AudioFileClip,
-    afx,
-    clips_array,
-)
+import cv2
+import numpy as np
 
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm", ".wmv", ".flv")
 
@@ -128,95 +121,104 @@ def compute_grid(n: int, cols: int) -> Tuple[int, int]:
     return rows, cols
 
 
-def load_and_prepare_clip(path: str, target_h: int, duration: Optional[float]) -> VideoFileClip:
-    clip = VideoFileClip(path)
-    # Resize while preserving aspect
-    if target_h > 0:
-        clip = clip.resize(height=target_h)
-    if duration is not None:
-        if clip.duration > duration:
-            clip = clip.subclip(0, duration)
-        elif clip.duration < duration:
-            # pad by freezing last frame (create an ImageClip of the last frame)
-            freeze_time = max(0.0, clip.duration - 1e-3)
-            freeze_v = clip.to_ImageClip(t=freeze_time).set_duration(duration - clip.duration)
-            # Keep FPS consistent for smoother concat
-            try:
-                freeze_v = freeze_v.set_fps(clip.fps)
-            except Exception:
-                pass
-            clip = concatenate_videoclips([clip, freeze_v])
-    return clip
-
-
-def build_audio(clips: List[VideoFileClip], strategy: str) -> Optional[AudioFileClip]:
-    if strategy == "none":
-        return None
-    # Filter clips with audio
-    auds = [c.audio for c in clips if c.audio is not None]
-    if not auds:
-        return None
-    if strategy == "first":
-        return auds[0]
-    if strategy == "mix":
-        # Simple average mix to avoid clipping significantly
-        # Normalize each audio to avoid huge differences
-        normed = []
-        for a in auds:
-            try:
-                # Apply volumex after measuring max (approx) -- moviepy lacks direct RMS quickly; keep simple
-                normed.append(a.volumex(1.0 / len(auds)))
-            except Exception:
-                normed.append(a.volumex(1.0 / len(auds)))
-        return CompositeAudioClip(normed)
-    raise ValueError(f"Unknown audio strategy: {strategy}")
-
-
-def build_grid(clips: List[VideoFileClip], rows: int, cols: int):
-    # Pad list with black clips if needed to fill grid
-    total = rows * cols
-    if len(clips) < total:
-        w, h = clips[0].w, clips[0].h
-        from moviepy.editor import ColorClip  # lazy import
-        blanks = total - len(clips)
-        for _ in range(blanks):
-            clips.append(ColorClip(size=(w, h), color=(0, 0, 0)).set_duration(clips[0].duration))
-    grid = []
-    for r in range(rows):
-        row_clips = clips[r*cols:(r+1)*cols]
-        grid.append(row_clips)
-    return clips_array(grid)
-
-
-def ensure_ffmpeg(prefer_imageio: bool = True) -> None:
-    """Ensure a recent ffmpeg binary is used.
-
-    If prefer_imageio is True and imageio-ffmpeg is available, point MoviePy/ImageIO
-    to that binary to avoid distro-provided outdated ffmpeg.
+def load_and_prepare_clip_cv2(path: str, target_h: int, duration: Optional[float]) -> Tuple[list, float, int, int, float]:
     """
-    if not prefer_imageio:
-        return
-    try:
-        import imageio_ffmpeg  # type: ignore
+    Loads video frames using OpenCV, resizes to target_h, and trims/pads to duration (in seconds).
+    Returns: (frames, fps, width, height, actual_duration)
+    """
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps < 1:
+        fps = 24.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frames = []
+    max_frames = total_frames
+    if duration is not None:
+        max_frames = int(round(fps * duration))
+    while len(frames) < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Resize to target_h
+        if target_h > 0 and frame.shape[0] != target_h:
+            aspect = frame.shape[1] / frame.shape[0]
+            new_w = int(round(target_h * aspect))
+            frame = cv2.resize(frame, (new_w, target_h))
+        frames.append(frame)
+    cap.release()
+    # Pad with last frame if needed
+    if duration is not None and len(frames) < max_frames and frames:
+        last = frames[-1]
+        while len(frames) < max_frames:
+            frames.append(last.copy())
+    if frames:
+        h, w = frames[0].shape[:2]
+    else:
+        h, w = target_h, target_h
+    actual_duration = len(frames) / fps
+    return frames, fps, w, h, actual_duration
 
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        # For imageio-ffmpeg consumers
-        os.environ.setdefault("IMAGEIO_FFMPEG_EXE", ffmpeg_exe)
-        # For moviepy (older versions read config setting)
-        try:
-            from moviepy.config import change_settings  # type: ignore
 
-            change_settings({"FFMPEG_BINARY": ffmpeg_exe})
-        except Exception:
-            pass
-    except Exception:
-        # imageio-ffmpeg not available: will fall back to system ffmpeg
-        pass
+def build_audio(*args, **kwargs):
+    # No audio support in OpenCV version
+    return None
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    # Prefer a recent ffmpeg to avoid first-frame decode errors
-    ensure_ffmpeg(prefer_imageio=True)
+def make_collage_video(video_frames_list, grid_shape, max_width=0, fps=24, out_path=None):
+    """
+    video_frames_list: list of lists of frames (each is a list of np.ndarray)
+    grid_shape: (nRows, nCols)
+    max_width: int, if >0, scale collage to this width
+    fps: output fps
+    out_path: if set, write video to this path
+    """
+    n_videos = len(video_frames_list)
+    nRows, nCols = grid_shape
+    # Find the minimum number of frames across all videos
+    min_frames = min(len(frames) for frames in video_frames_list)
+    # Truncate all to min_frames
+    video_frames_list = [frames[:min_frames] for frames in video_frames_list]
+    # Assume all frames are same size as first
+    h, w = video_frames_list[0][0].shape[:2]
+    # Pad with black videos if needed
+    if n_videos < nRows * nCols:
+        blank = np.zeros_like(video_frames_list[0][0])
+        for _ in range(nRows * nCols - n_videos):
+            video_frames_list.append([blank.copy() for _ in range(min_frames)])
+    # Build each frame of the collage
+    collage_frames = []
+    for i in range(min_frames):
+        row_imgs = []
+        for r in range(nRows):
+            row = []
+            for c in range(nCols):
+                idx = r * nCols + c
+                row.append(video_frames_list[idx][i])
+            row_imgs.append(np.hstack(row))
+        collage = np.vstack(row_imgs)
+        collage_frames.append(collage)
+    # Optionally resize
+    if max_width > 0 and collage_frames[0].shape[1] > max_width:
+        scale = max_width / collage_frames[0].shape[1]
+        new_h = int(round(collage_frames[0].shape[0] * scale))
+        collage_frames = [cv2.resize(f, (max_width, new_h)) for f in collage_frames]
+    # Write video
+    if out_path:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(out_path, fourcc, fps, (collage_frames[0].shape[1], collage_frames[0].shape[0]))
+        for f in collage_frames:
+            out.write(f)
+        out.release()
+    return collage_frames
+
+
+
+
+
     args = parse_args(argv)
 
     all_videos = find_videos(args.inputs, recursive=args.recursive)
@@ -241,13 +243,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         shuffle_pool=args.shuffle,
     )
 
-    prepared: List[VideoFileClip] = []
+    prepared: list = []
     tried: set[str] = set()
 
-    def try_load(path: str) -> Optional[VideoFileClip]:
+    def try_load(path: str):
         tried.add(path)
         try:
-            return load_and_prepare_clip(path, cfg.resize_height, cfg.duration)
+            frames, fps, w, h, actual_duration = load_and_prepare_clip_cv2(path, cfg.resize_height, cfg.duration)
+            return dict(frames=frames, fps=fps, w=w, h=h, duration=actual_duration)
         except Exception as e:
             print(f"[WARN] Skipping {path}: {e}")
             return None
@@ -274,39 +277,87 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 4
 
     rows, cols = compute_grid(len(prepared), cfg.cols)
-    grid_clip = build_grid(prepared, rows, cols)
-
-    if not cfg.mute:
-        audio_clip = build_audio(prepared, cfg.audio)
-        if audio_clip is not None:
-            grid_clip = grid_clip.set_audio(audio_clip)
-    else:
-        grid_clip = grid_clip.set_audio(None)
-
-    try:
-        base_fps = getattr(prepared[0], "fps", None)
-    except Exception:
-        base_fps = None
-    out_fps = cfg.fps or (base_fps if isinstance(base_fps, (int, float)) and base_fps > 0 else 24)
+    # Use the minimum fps of all videos for safety
+    out_fps = cfg.fps or min(int(round(c['fps'])) for c in prepared if c['fps'] > 0) or 24
+    # Build the collage
+    video_frames_list = [c['frames'] for c in prepared]
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-
-    # Optionally scale final collage to a max width (preserving aspect)
-    if getattr(args, "max_width", 0) and grid_clip.w > args.max_width:
-        scale = args.max_width / float(grid_clip.w)
-        new_h = max(1, int(round(grid_clip.h * scale)))
-        grid_clip = grid_clip.resize(newsize=(args.max_width, new_h))
-
-    print(f"Writing collage to {args.out} ({rows}x{cols} grid, fps={out_fps}, size={grid_clip.w}x{grid_clip.h})")
-    try:
-        grid_clip.write_videofile(args.out, fps=out_fps, codec="libx264", audio_codec="aac")
-    finally:
-        # Close all clips to release resources
-        for c in prepared:
-            c.close()
-        grid_clip.close()
-    print("Done.")
+    make_collage_video(video_frames_list, (rows, cols), max_width=args.max_width, fps=out_fps, out_path=args.out)
+    print(f"Wrote collage to {args.out} ({rows}x{cols} grid, fps={out_fps})")
     return 0
 
 
+def main():
+    import sys
+    return _main(sys.argv[1:])
+
+def _main(argv=None):
+    args = parse_args(argv)
+
+    all_videos = find_videos(args.inputs, recursive=args.recursive)
+    if not all_videos:
+        print("No videos found", file=sys.stderr)
+        return 2
+
+    chosen = select_paths(all_videos, args.num, args.seed, args.shuffle)
+    if not chosen:
+        print("Failed to select videos", file=sys.stderr)
+        return 3
+
+    cfg = CollageConfig(
+        num=args.num,
+        cols=args.cols,
+        duration=args.duration,
+        resize_height=args.resize_height,
+        seed=args.seed,
+        audio=args.audio,
+        mute=args.mute,
+        fps=args.fps,
+        shuffle_pool=args.shuffle,
+    )
+
+    prepared: list = []
+    tried: set[str] = set()
+
+    def try_load(path: str):
+        tried.add(path)
+        try:
+            frames, fps, w, h, actual_duration = load_and_prepare_clip_cv2(path, cfg.resize_height, cfg.duration)
+            return dict(frames=frames, fps=fps, w=w, h=h, duration=actual_duration)
+        except Exception as e:
+            print(f"[WARN] Skipping {path}: {e}")
+            return None
+
+    for p in chosen:
+        clip = try_load(p)
+        if clip is not None:
+            prepared.append(clip)
+
+    # If we didn't reach desired count due to unreadable files, pull more from the pool
+    if len(prepared) < cfg.num:
+        remaining = [p for p in all_videos if p not in tried]
+        if cfg.seed is not None:
+            random.seed(cfg.seed + 1)
+        random.shuffle(remaining)
+        for p in remaining:
+            if len(prepared) >= cfg.num:
+                break
+            clip = try_load(p)
+            if clip is not None:
+                prepared.append(clip)
+    if not prepared:
+        print("No clips loaded", file=sys.stderr)
+        return 4
+
+    rows, cols = compute_grid(len(prepared), cfg.cols)
+    # Use the minimum fps of all videos for safety
+    out_fps = cfg.fps or min(int(round(c['fps'])) for c in prepared if c['fps'] > 0) or 24
+    # Build the collage
+    video_frames_list = [c['frames'] for c in prepared]
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    make_collage_video(video_frames_list, (rows, cols), max_width=args.max_width, fps=out_fps, out_path=args.out)
+    print(f"Wrote collage to {args.out} ({rows}x{cols} grid, fps={out_fps})")
+    return 0
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    SystemExit(main())

@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """Build a collage (grid) of randomly selected video clips.
 
@@ -33,8 +34,6 @@ Examples:
   python video_collage.py --inputs videos/ --recursive -n 9 --cols 0 --out collage.mp4
   python video_collage.py --inputs videos --recursive -n 8 --resize-height 240 --duration 5 --seed 123 --out collage.mp4
 """
-from __future__ import annotations
-
 import argparse
 import math
 import os

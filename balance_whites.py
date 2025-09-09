@@ -5,6 +5,7 @@ Batch white balance images to a common white point using OpenCV.
 Features:
 - Illuminant estimation via Gray-World or Shades-of-Gray (Minkowski p-norm).
 - Choose a reference image or use the median white across inputs for consistency.
+- Or specify a target color temperature in Kelvin to balance all images to the same white.
 - Saturation-aware estimation to avoid blown highlights.
 - Simple CLI with dir/glob support and safe output handling.
 """
@@ -34,6 +35,7 @@ class WBConfig:
 	target_mode: str = "median"  # 'median' | 'mean' | 'reference'
 	gains_norm: str = "geometric"  # 'geometric' | 'none' | 'green'
 	ref_image: Optional[str] = None
+	kelvin: Optional[float] = None  # If provided, use this CCT as target white
 
 
 def _to_float01(bgr8: np.ndarray) -> np.ndarray:
@@ -101,6 +103,83 @@ def normalize_gains(gains_bgr: np.ndarray, mode: str = "geometric") -> np.ndarra
 	if gm <= 0:
 		return g
 	return g / gm
+
+
+# ----------------------------- Kelvin utilities --------------------------- #
+
+
+def _srgb_gamma_encode(linear_rgb: np.ndarray) -> np.ndarray:
+	"""Convert linear RGB in [0, +inf) to sRGB gamma-encoded [0,1]."""
+	a = 0.055
+	rgb = np.clip(linear_rgb, 0.0, None).astype(np.float32)
+	low = rgb <= 0.0031308
+	out = np.empty_like(rgb)
+	out[low] = 12.92 * rgb[low]
+	out[~low] = (1 + a) * np.power(rgb[~low], 1 / 2.4) - a
+	return np.clip(out, 0.0, 1.0)
+
+
+def kelvin_to_srgb_bgr_white(kelvin: float) -> np.ndarray:
+	"""Approximate the sRGB gamma-encoded BGR white vector for a given CCT.
+
+	Steps:
+	- Convert CCT (Kelvin) to CIE xy chromaticity (McCamy-esque piecewise fit).
+	- Set Y=1 to get XYZ, then convert to linear sRGB via XYZ->RGB.
+	- Gamma-encode to sRGB, clamp to [0,1], and return in BGR order.
+
+	Returns: np.ndarray of shape (3,) in BGR order.
+	"""
+	# Clamp reasonable range to keep approximation valid
+	T = float(np.clip(kelvin, 1667.0, 25000.0))
+
+	# Compute x from CCT
+	if T <= 4000.0:
+		x = (
+			-0.2661239e9 / (T ** 3)
+			- 0.2343580e6 / (T ** 2)
+			+ 0.8776956e3 / T
+			+ 0.179910
+		)
+	else:
+		x = (
+			-3.0258469e9 / (T ** 3)
+			+ 2.1070379e6 / (T ** 2)
+			+ 0.2226347e3 / T
+			+ 0.240390
+		)
+
+	# Compute y from x depending on range
+	if T <= 2222.0:
+		y = -1.1063814 * x ** 3 - 1.34811020 * x ** 2 + 2.18555832 * x - 0.20219683
+	elif T <= 4000.0:
+		y = -0.9549476 * x ** 3 - 1.37418593 * x ** 2 + 2.09137015 * x - 0.16748867
+	else:
+		y = 3.0817580 * x ** 3 - 5.87338670 * x ** 2 + 3.75112997 * x - 0.37001483
+
+	# Convert xyY (Y=1) to XYZ
+	if y <= 1e-6:
+		X, Y, Z = 1.0, 1.0, 1.0
+	else:
+		X = x / y
+		Y = 1.0
+		Z = (1.0 - x - y) / y
+	XYZ = np.array([X, Y, Z], dtype=np.float32)
+
+	# XYZ to linear sRGB
+	M = np.array([
+		[3.2406, -1.5372, -0.4986],
+		[-0.9689, 1.8758, 0.0415],
+		[0.0557, -0.2040, 1.0570],
+	], dtype=np.float32)
+	rgb_lin = M @ XYZ
+	# Remove negatives (out-of-gamut) before gamma
+	rgb_lin = np.clip(rgb_lin, 0.0, None)
+	rgb = _srgb_gamma_encode(rgb_lin)
+	# Return BGR order
+	bgr = np.array([rgb[2], rgb[1], rgb[0]], dtype=np.float32)
+	# Avoid zeros to keep division safe; scale not critical (later normalized)
+	bgr = np.clip(bgr, 1e-6, None)
+	return bgr
 
 
 def apply_gains(img_bgr: np.ndarray, gains_bgr: np.ndarray) -> np.ndarray:
@@ -190,6 +269,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 	p.add_argument("--reference", default=None, help="Reference image path when --target=reference.")
 	p.add_argument("--gains-norm", default="geometric", choices=["geometric", "none", "green"], help="Normalize channel gains to stabilize brightness.")
 
+	p.add_argument("--kelvin", type=float, default=None, help="If provided, use this color temperature (Kelvin) as target white for all images, overriding --target/--reference.")
+
 	p.add_argument("--recursive", action="store_true", help="Recurse into subdirectories for dir/glob inputs.")
 	return p.parse_args(argv)
 
@@ -205,6 +286,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 		target_mode=args.target,
 		gains_norm=args.gains_norm,
 		ref_image=args.reference,
+		kelvin=args.kelvin,
 	)
 
 	img_paths = find_images(args.inputs, recursive=args.recursive)
@@ -218,7 +300,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 	ref_white: Optional[np.ndarray] = None
 	whites: List[np.ndarray] = []
 	ordered_paths = img_paths
-	if cfg.target_mode == "reference":
+	if cfg.kelvin is not None:
+		# Kelvin overrides any data-driven target; we'll compute target_white from CCT
+		pass
+	elif cfg.target_mode == "reference":
 		if not cfg.ref_image:
 			print("--target=reference requires --reference PATH", file=sys.stderr)
 			return 2
@@ -236,7 +321,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 		# Keep processing original ordering; target will use ref_white
 
 	# Estimate whites for all images (if not reference-only we compute for target median/mean)
-	if cfg.target_mode in ("median", "mean"):
+	if cfg.kelvin is None and cfg.target_mode in ("median", "mean"):
 		for pth in ordered_paths:
 			img = cv2.imread(pth, cv2.IMREAD_UNCHANGED)
 			if img is None:
@@ -248,7 +333,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 		# For reference mode but other images may still need their own estimation for gains
 		pass
 
-	if cfg.target_mode == "reference":
+	if cfg.kelvin is not None:
+		target_white = kelvin_to_srgb_bgr_white(cfg.kelvin)
+	elif cfg.target_mode == "reference":
 		target_white = ref_white
 		if target_white is None:
 			print("Internal error: reference white not computed", file=sys.stderr)

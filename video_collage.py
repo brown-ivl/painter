@@ -219,7 +219,7 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
         d_blank = max(1.0, min((m.get("duration") or 0.0) for m in meta_list) or 1.0)
     for j in range(blanks):
         label = f"b{j}"
-        parts.append(f"color=size={cell_w}x{cell_h}:color=black:rate={out_fps}:d={d_blank}[{label}]")
+        parts.append(f"color=c=black:s={cell_w}x{cell_h}:r={out_fps}:d={d_blank}[{label}]")
         labels.append(f"[{label}]")
 
     # xstack layout
@@ -234,7 +234,8 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
     layout = "|".join(layout_elems)
     inputs_concat = "".join(labels)
     xstack_out = "st"
-    parts.append(f"{inputs_concat}xstack=inputs={total}:layout={layout}:shortest={shortest}:fill=black[{xstack_out}]")
+    # Use xstack without 'fill' for broader ffmpeg compatibility; inputs are uniform size already
+    parts.append(f"{inputs_concat}xstack=inputs={total}:layout={layout}:shortest={shortest}[{xstack_out}]")
 
     out_w = cell_w * cols
     out_h = cell_h * rows
@@ -253,8 +254,8 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
         htmp = f"{cell_h}+({out_h}-{cell_h})*min(1,t/{mid})"
         wexpr = f"trunc(({wtmp})/2)*2"
         hexpr = f"trunc(({htmp})/2)*2"
-        xexpr = f"max(0,min({cx}-w/2, {out_w}-w))"
-        yexpr = f"max(0,min({cy}-h/2, {out_h}-h))"
+        xexpr = f"max(0,min({cx}-w/2, in_w-w))"
+        yexpr = f"max(0,min({cy}-h/2, in_h-h))"
         parts.append(f"{final_src}crop=w={wexpr}:h={hexpr}:x={xexpr}:y={yexpr},scale={out_w}:{out_h}[cz]")
         final_src = "[cz]"
 

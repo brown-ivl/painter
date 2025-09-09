@@ -248,7 +248,7 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
         c0 = fi % cols
         cx = c0 * cell_w + cell_w / 2.0
         cy = r0 * cell_h + cell_h / 2.0
-        # Use zoompan for robust per-frame zoom instead of dynamic crop expressions
+    # Use zoompan for robust per-frame zoom instead of dynamic crop expressions
     z0 = max(rows, cols)  # start fully on one cell or tighter (no other cells visible)
     mid_frames = max(1, int(round(out_fps * duration / 2.0)))
     # Smooth ease-out from z0 to 1 by mid-duration using smoothstep: 3u^2 - 2u^3

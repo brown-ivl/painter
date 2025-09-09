@@ -254,7 +254,7 @@ def ensure_out_path(out_dir: Optional[str], in_path: str, suffix: str, out_forma
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 	p = argparse.ArgumentParser(description="Batch white balance images to a common white point.")
-	p.add_argument("inputs", nargs="+", help="Input image files, dirs, or globs.")
+	p.add_argument("--inputs", nargs="+", help="Input image files, dirs, or globs.")
 	p.add_argument("--out-dir", default=None, help="Output directory (will be created). Default: alongside inputs.")
 	p.add_argument("--suffix", default="_wb", help="Suffix for output filenames (before extension). Default: _wb")
 	p.add_argument("--format", default=None, help="Output format/extension (e.g., jpg, png). Default: keep input extension.")

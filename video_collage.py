@@ -242,6 +242,9 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
     # Optional cinema-zoom (zoom-out) until mid-duration
     final_src = f"[{xstack_out}]"
     if cinema_zoom and duration and duration > 0:
+        # Ensure constant FPS before zoompan to keep frame counts stable
+        parts.append(f"{final_src}fps={out_fps}[stf]")
+        final_src = "[stf]"
         # Focus on the given cell index
         fi = max(0, min(rows * cols - 1, focus_index))
         r0 = fi // cols
@@ -255,11 +258,11 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
         # u = on/mid_frames
         ease = f"(3*pow(on/{mid_frames}\\,2) - 2*pow(on/{mid_frames}\\,3))"
         zoom_expr = f"if(lte(on\\,{mid_frames})\\,{z0} - ({z0}-1)*{ease}\\,1)"
-        x_expr = f"max(0\\,min({cx}-iw/zoom/2\\, iw-iw/zoom))"
-        y_expr = f"max(0\\,min({cy}-ih/zoom/2\\, ih-ih/zoom))"
-    parts.append(f"{final_src}zoompan=z={zoom_expr}:x={x_expr}:y={y_expr}:d=1:fps={out_fps}:s={out_w}x{out_h}[cz]")
-    # Normalize PTS and enforce exact duration
-    parts.append(f"[cz]setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={duration},trim=duration={duration},setpts=PTS-STARTPTS[czt]")
+    x_expr = f"max(0\\,min({cx}-iw/zoom/2\\, iw-iw/zoom))"
+    y_expr = f"max(0\\,min({cy}-ih/zoom/2\\, ih-ih/zoom))"
+    parts.append(f"{final_src}zoompan=z={zoom_expr}:x={x_expr}:y={y_expr}:d=1:s={out_w}x{out_h}[cz]")
+    # Normalize PTS and enforce exact duration, then fix constant FPS without changing duration
+    parts.append(f"[cz]setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={duration},trim=duration={duration},setpts=PTS-STARTPTS,fps={out_fps}[czt]")
     final_src = "[czt]"
 
     # Optional downscale

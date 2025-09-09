@@ -248,17 +248,17 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
         c0 = fi % cols
         cx = c0 * cell_w + cell_w / 2.0
         cy = r0 * cell_h + cell_h / 2.0
-    # Use zoompan for robust per-frame zoom instead of dynamic crop expressions
-    z0 = max(rows, cols)  # start fully on one cell or tighter (no other cells visible)
-    mid_frames = max(1, int(round(out_fps * duration / 2.0)))
-    # Smooth ease-out from z0 to 1 by mid-duration using smoothstep: 3u^2 - 2u^3
-    # u = on/mid_frames
-    ease = f"(3*pow(on/{mid_frames}\\,2) - 2*pow(on/{mid_frames}\\,3))"
-    zoom_expr = f"if(lte(on\\,{mid_frames})\\,{z0} - ({z0}-1)*{ease}\\,1)"
-    x_expr = f"max(0\\,min({cx}-iw/zoom/2\\, iw-iw/zoom))"
-    y_expr = f"max(0\\,min({cy}-ih/zoom/2\\, ih-ih/zoom))"
-    parts.append(f"{final_src}zoompan=z={zoom_expr}:x={x_expr}:y={y_expr}:d=1:fps={out_fps}:s={out_w}x{out_h}[cz]")
-    final_src = "[cz]"
+        # Use zoompan for robust per-frame zoom instead of dynamic crop expressions
+        z0 = max(rows, cols)  # start fully on one cell or tighter (no other cells visible)
+        mid_frames = max(1, int(round(out_fps * duration / 2.0)))
+        # Smooth ease-out from z0 to 1 by mid-duration using smoothstep: 3u^2 - 2u^3
+        # u = on/mid_frames
+        ease = f"(3*pow(on/{mid_frames}\\,2) - 2*pow(on/{mid_frames}\\,3))"
+        zoom_expr = f"if(lte(on\\,{mid_frames})\\,{z0} - ({z0}-1)*{ease}\\,1)"
+        x_expr = f"max(0\\,min({cx}-iw/zoom/2\\, iw-iw/zoom))"
+        y_expr = f"max(0\\,min({cy}-ih/zoom/2\\, ih-ih/zoom))"
+        parts.append(f"{final_src}zoompan=z={zoom_expr}:x={x_expr}:y={y_expr}:d=1:fps={out_fps}:s={out_w}x{out_h}[cz]")
+        final_src = "[cz]"
 
     # Optional downscale
     if max_width and out_w > max_width:

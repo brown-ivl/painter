@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Batch white balance images to a common white point using OpenCV.
+Batch white balance images to a specified color temperature in Kelvin using OpenCV.
 
 Features:
-- Illuminant estimation via Gray-World or Shades-of-Gray (Minkowski p-norm).
-- Choose a reference image or use the median white across inputs for consistency.
-- Or specify a target color temperature in Kelvin to balance all images to the same white.
+- Specify a target color temperature (Kelvin) and balance all images to that white.
+- Robust illuminant estimation (shades-of-gray) per image to compute gains.
 - Saturation-aware estimation to avoid blown highlights.
 - Simple CLI with dir/glob support and safe output handling.
 """
@@ -16,26 +15,13 @@ import argparse
 import os
 import sys
 import glob
-from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 import cv2
 import numpy as np
 
 
 # ----------------------------- Core algorithms ----------------------------- #
-
-
-@dataclass
-class WBConfig:
-	method: str = "shades"  # 'grayworld' | 'shades'
-	p: float = 6.0  # Minkowski p for shades-of-gray
-	sat_thresh: float = 0.98  # exclude pixels with any channel >= thresh (in [0,1])
-	low_thresh: float = 0.0   # optionally exclude near-black pixels
-	target_mode: str = "median"  # 'median' | 'mean' | 'reference'
-	gains_norm: str = "geometric"  # 'geometric' | 'none' | 'green'
-	ref_image: Optional[str] = None
-	kelvin: Optional[float] = None  # If provided, use this CCT as target white
 
 
 def _to_float01(bgr8: np.ndarray) -> np.ndarray:
@@ -56,37 +42,21 @@ def _valid_mask(img_f: np.ndarray, sat_thresh: float, low_thresh: float) -> np.n
 	return below_top & above_low
 
 
-def estimate_white(img_bgr: np.ndarray, cfg: WBConfig) -> np.ndarray:
-	"""Estimate the scene's white/illuminant vector in BGR order.
-
-	Returns vector of shape (3,) with positive values; higher means stronger channel.
-	"""
+def estimate_white(img_bgr: np.ndarray, p: float = 6.0, sat_thresh: float = 0.98, low_thresh: float = 0.0) -> np.ndarray:
+	"""Estimate scene white (B,G,R) using shades-of-gray (Minkowski p-norm)."""
 	img_f = _to_float01(img_bgr)
-	mask = _valid_mask(img_f, cfg.sat_thresh, cfg.low_thresh)
+	mask = _valid_mask(img_f, sat_thresh, low_thresh)
 	if not np.any(mask):
-		# Fallback: use all pixels
 		mask = np.ones(img_f.shape[:2], dtype=bool)
-
-	# Extract masked pixels per channel
 	ch = [img_f[..., c][mask] for c in range(3)]  # B, G, R
-
-	if cfg.method.lower() in ("grayworld", "gray-world", "gw"):
-		vals = np.array([np.mean(c) if c.size else 1.0 for c in ch], dtype=np.float32)
-	elif cfg.method.lower() in ("shades", "shades-of-gray", "sog"):
-		p = float(cfg.p)
-		# Minkowski p-norm mean: (mean(|x|^p))^(1/p)
-		def minkowski_mean(x: np.ndarray) -> float:
-			if x.size == 0:
-				return 1.0
-			return float(np.power(np.mean(np.power(x, p)), 1.0 / p))
-
-		vals = np.array([minkowski_mean(c) for c in ch], dtype=np.float32)
-	else:
-		raise ValueError(f"Unknown method: {cfg.method}")
-
-	# Prevent zeros
+	pf = float(p)
+	def minkowski_mean(x: np.ndarray) -> float:
+		if x.size == 0:
+			return 1.0
+		return float(np.power(np.mean(np.power(x, pf)), 1.0 / pf))
+	vals = np.array([minkowski_mean(c) for c in ch], dtype=np.float32)
 	vals = np.clip(vals, 1e-6, None)
-	return vals  # B,G,R
+	return vals  # B, G, R
 
 
 def normalize_gains(gains_bgr: np.ndarray, mode: str = "geometric") -> np.ndarray:
@@ -192,21 +162,7 @@ def apply_gains(img_bgr: np.ndarray, gains_bgr: np.ndarray) -> np.ndarray:
 	return (out * 255.0 + 0.5).astype(np.uint8)
 
 
-def compute_target_white(whites: List[np.ndarray], cfg: WBConfig) -> np.ndarray:
-	arr = np.stack(whites, axis=0)  # (N,3)
-	mode = cfg.target_mode.lower()
-	if mode == "median":
-		tgt = np.median(arr, axis=0)
-	elif mode == "mean":
-		tgt = np.mean(arr, axis=0)
-	elif mode == "reference":
-		if cfg.ref_image is None:
-			raise ValueError("target_mode=reference requires ref_image")
-		tgt = whites[0]  # will be overridden by caller when passing ref first
-	else:
-		raise ValueError(f"Unknown target_mode: {cfg.target_mode}")
-	tgt = np.clip(tgt.astype(np.float32), 1e-6, None)
-	return tgt
+# No data-driven target aggregation is needed; target white comes from Kelvin
 
 
 # ----------------------------- I/O and CLI -------------------------------- #
@@ -253,23 +209,19 @@ def ensure_out_path(out_dir: Optional[str], in_path: str, suffix: str, out_forma
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-	p = argparse.ArgumentParser(description="Batch white balance images to a common white point.")
-	p.add_argument("--inputs", nargs="+", help="Input image files, dirs, or globs.")
+	p = argparse.ArgumentParser(description="White balance images to a specified color temperature (Kelvin).")
+	p.add_argument("--inputs", nargs="+", required=True, help="Input image files, dirs, or globs.")
+	p.add_argument("--kelvin", type=float, required=True, help="Target color temperature in Kelvin (e.g., 6500).")
 	p.add_argument("--out-dir", default=None, help="Output directory (will be created). Default: alongside inputs.")
 	p.add_argument("--suffix", default="_wb", help="Suffix for output filenames (before extension). Default: _wb")
 	p.add_argument("--format", default=None, help="Output format/extension (e.g., jpg, png). Default: keep input extension.")
 	p.add_argument("--overwrite", action="store_true", help="Allow overwriting existing files.")
 
-	p.add_argument("--method", default="shades", choices=["grayworld", "shades"], help="Illuminant estimation method.")
+	# Estimation and application knobs
 	p.add_argument("--p", type=float, default=6.0, help="Minkowski p for shades-of-gray (higher is more like max).")
 	p.add_argument("--sat-thresh", type=float, default=0.98, help="Exclude pixels with any channel >= this (0-1).")
 	p.add_argument("--low-thresh", type=float, default=0.0, help="Exclude pixels with any channel <= this (0-1).")
-
-	p.add_argument("--target", default="median", choices=["median", "mean", "reference"], help="Target white definition across images.")
-	p.add_argument("--reference", default=None, help="Reference image path when --target=reference.")
 	p.add_argument("--gains-norm", default="geometric", choices=["geometric", "none", "green"], help="Normalize channel gains to stabilize brightness.")
-
-	p.add_argument("--kelvin", type=float, default=None, help="If provided, use this color temperature (Kelvin) as target white for all images, overriding --target/--reference.")
 
 	p.add_argument("--recursive", action="store_true", help="Recurse into subdirectories for dir/glob inputs.")
 	return p.parse_args(argv)
@@ -278,17 +230,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
 	args = parse_args(argv)
 
-	cfg = WBConfig(
-		method=args.method,
-		p=args.p,
-		sat_thresh=args.sat_thresh,
-		low_thresh=args.low_thresh,
-		target_mode=args.target,
-		gains_norm=args.gains_norm,
-		ref_image=args.reference,
-		kelvin=args.kelvin,
-	)
-
+	# Collect inputs
 	img_paths = find_images(args.inputs, recursive=args.recursive)
 	if not img_paths:
 		print("No images found for given inputs", file=sys.stderr)
@@ -296,67 +238,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 	os.makedirs(args.out_dir, exist_ok=True) if args.out_dir else None
 
-	# If reference mode, ensure reference is in the list and first
-	ref_white: Optional[np.ndarray] = None
-	whites: List[np.ndarray] = []
-	ordered_paths = img_paths
-	if cfg.kelvin is not None:
-		# Kelvin overrides any data-driven target; we'll compute target_white from CCT
-		pass
-	elif cfg.target_mode == "reference":
-		if not cfg.ref_image:
-			print("--target=reference requires --reference PATH", file=sys.stderr)
-			return 2
-		ref_abs = os.path.abspath(cfg.ref_image)
-		if not os.path.isfile(ref_abs):
-			print(f"Reference image not found: {cfg.ref_image}", file=sys.stderr)
-			return 2
-		# Load ref first for white estimation
-		ref_img = cv2.imread(ref_abs, cv2.IMREAD_UNCHANGED)
-		if ref_img is None:
-			print(f"Failed to read reference image: {cfg.ref_image}", file=sys.stderr)
-			return 2
-		ref_white = estimate_white(ref_img, cfg)
-		whites.append(ref_white)
-		# Keep processing original ordering; target will use ref_white
-
-	# Estimate whites for all images (if not reference-only we compute for target median/mean)
-	if cfg.kelvin is None and cfg.target_mode in ("median", "mean"):
-		for pth in ordered_paths:
-			img = cv2.imread(pth, cv2.IMREAD_UNCHANGED)
-			if img is None:
-				print(f"[WARN] Skipping unreadable: {pth}")
-				continue
-			w = estimate_white(img, cfg)
-			whites.append(w)
-	else:
-		# For reference mode but other images may still need their own estimation for gains
-		pass
-
-	if cfg.kelvin is not None:
-		target_white = kelvin_to_srgb_bgr_white(cfg.kelvin)
-	elif cfg.target_mode == "reference":
-		target_white = ref_white
-		if target_white is None:
-			print("Internal error: reference white not computed", file=sys.stderr)
-			return 3
-	else:
-		if not whites:
-			print("No valid images to estimate target white", file=sys.stderr)
-			return 3
-		target_white = compute_target_white(whites, cfg)
+	# Target white from specified Kelvin
+	target_white = kelvin_to_srgb_bgr_white(args.kelvin)
 
 	# Process and write outputs
 	num_done = 0
-	for pth in ordered_paths:
+	for pth in img_paths:
 		img = cv2.imread(pth, cv2.IMREAD_UNCHANGED)
 		if img is None:
 			print(f"[WARN] Skipping unreadable: {pth}")
 			continue
-		# Per-image white for gains
-		w = estimate_white(img, cfg)
+		# Estimate scene white and compute gains to move it to the target white
+		w = estimate_white(img, p=args.p, sat_thresh=args.sat_thresh, low_thresh=args.low_thresh)
 		gains = target_white / np.clip(w, 1e-6, None)
-		gains = normalize_gains(gains, mode=cfg.gains_norm)
+		gains = normalize_gains(gains, mode=args.gains_norm)
 		out_img = apply_gains(img, gains)
 		out_path = ensure_out_path(args.out_dir, pth, args.suffix, args.format)
 		os.makedirs(os.path.dirname(out_path), exist_ok=True)

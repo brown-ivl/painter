@@ -90,6 +90,8 @@ class CollageConfig:
     fps: Optional[int]
     shuffle_pool: bool
     max_width: int
+    cinema_zoom: bool
+    focus_index: int
 
 
 # ---------- CLI ----------
@@ -106,6 +108,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     p.add_argument("--fps", type=int, default=None, help="Override output FPS (default: min of inputs or 24)")
     p.add_argument("--shuffle", action="store_true", help="Shuffle candidate list before selection")
+    p.add_argument("--cinema-zoom", action="store_true", help="Start on one cell and zoom out to full grid by mid-duration (requires --duration)")
+    p.add_argument("--focus-index", type=int, default=0, help="Which selected clip index to focus at start (default: 0)")
     p.add_argument("--out", required=True, help="Output video path (mp4)")
     return p.parse_args(argv)
 
@@ -179,8 +183,8 @@ def even(x: int) -> int:
     return x if x % 2 == 0 else x - 1
 
 
-def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, target_h: int, out_fps: int, duration: Optional[float], max_width: int) -> Tuple[str, Tuple[int, int]]:
-    """Build filter_complex for xstack grid and return (filter, (out_w, out_h))."""
+def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, target_h: int, out_fps: int, duration: Optional[float], max_width: int, cinema_zoom: bool, focus_index: int) -> Tuple[str, Tuple[int, int], str]:
+    """Build filter_complex for xstack grid and return (filter, (out_w, out_h), final_label)."""
     # Compute scaled width per input and max column width
     scaled_w = []
     for m in meta_list:
@@ -234,20 +238,40 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
 
     out_w = cell_w * cols
     out_h = cell_h * rows
+    # Optional cinema-zoom (zoom-out) until mid-duration
+    final_src = f"[{xstack_out}]"
+    if cinema_zoom and duration and duration > 0:
+        # Focus on the given cell index
+        fi = max(0, min(rows * cols - 1, focus_index))
+        r0 = fi // cols
+        c0 = fi % cols
+        cx = c0 * cell_w + cell_w / 2.0
+        cy = r0 * cell_h + cell_h / 2.0
+        mid = max(0.001, duration / 2.0)
+        # Expressions for animated crop size (even) and centered position clamped to frame
+        wtmp = f"{cell_w}+({out_w}-{cell_w})*min(1,t/{mid})"
+        htmp = f"{cell_h}+({out_h}-{cell_h})*min(1,t/{mid})"
+        wexpr = f"trunc(({wtmp})/2)*2"
+        hexpr = f"trunc(({htmp})/2)*2"
+        xexpr = f"max(0,min({cx}-w/2, {out_w}-w))"
+        yexpr = f"max(0,min({cy}-h/2, {out_h}-h))"
+        parts.append(f"{final_src}crop=w={wexpr}:h={hexpr}:x={xexpr}:y={yexpr},scale={out_w}:{out_h}[cz]")
+        final_src = "[cz]"
+
     # Optional downscale
     if max_width and out_w > max_width:
         scale_h = even(int(round(out_h * (max_width / out_w))))
-        parts.append(f"[{xstack_out}]scale={even(max_width)}:{scale_h}[vout]")
+        parts.append(f"{final_src}scale={even(max_width)}:{scale_h}[vout]")
         out_w, out_h = even(max_width), scale_h
         final_label = "[vout]"
     else:
-        final_label = f"[{xstack_out}]"
+        final_label = final_src
 
     filter_complex = ";".join(parts)
-    return filter_complex, (out_w, out_h)
+    return filter_complex, (out_w, out_h), final_label
 
 
-def run_ffmpeg_grid(paths: List[str], rows: int, cols: int, target_h: int, out_fps: int, duration: Optional[float], max_width: int, out_path: str) -> int:
+def run_ffmpeg_grid(paths: List[str], rows: int, cols: int, target_h: int, out_fps: int, duration: Optional[float], max_width: int, out_path: str, cinema_zoom: bool, focus_index: int) -> int:
     # Probe all inputs
     meta_list: List[Dict[str, Any]] = []
     good_paths: List[str] = []
@@ -263,15 +287,15 @@ def run_ffmpeg_grid(paths: List[str], rows: int, cols: int, target_h: int, out_f
         return 4
 
     # Build filter graph
-    filt, (out_w, out_h) = make_filter_complex(meta_list, rows, cols, target_h, out_fps, duration, max_width)
+    filt, (out_w, out_h), final_label = make_filter_complex(meta_list, rows, cols, target_h, out_fps, duration, max_width, cinema_zoom, focus_index)
 
     # Build command
     cmd: List[str] = ["ffmpeg", "-y", "-hide_banner", "-stats", "-loglevel", "warning"]
     for p in good_paths:
         cmd += ["-i", p]
     cmd += [
-        "-filter_complex", filt,
-        "-map", "[vout]" if "[vout]" in filt else "[st]",
+    "-filter_complex", filt,
+    "-map", final_label,
         "-r", str(out_fps),
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-preset", "veryfast", "-crf", "23",
@@ -323,6 +347,8 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         fps=args.fps,
         shuffle_pool=args.shuffle,
         max_width=args.max_width,
+        cinema_zoom=args.cinema_zoom,
+        focus_index=args.focus_index,
     )
 
     # Probe-first selection, skipping unreadables
@@ -357,6 +383,10 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         return 4
 
     rows, cols = compute_grid(len(prepared_paths), cfg.cols)
+    # Validate cinema-zoom requirements
+    if cfg.cinema_zoom and (cfg.duration is None or cfg.duration <= 0):
+        print("--cinema-zoom requires --duration > 0 (transition completes at mid-duration)", file=sys.stderr)
+        return 2
     # Determine output FPS: min across inputs (fallback 24) if not provided
     if cfg.fps is not None:
         out_fps = int(cfg.fps)
@@ -369,7 +399,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         out_fps = int(max(1, int(min(fps_vals) if fps_vals else 24)))
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    rc = run_ffmpeg_grid(prepared_paths, rows, cols, cfg.resize_height, out_fps, cfg.duration, cfg.max_width, args.out)
+    rc = run_ffmpeg_grid(prepared_paths, rows, cols, cfg.resize_height, out_fps, cfg.duration, cfg.max_width, args.out, cfg.cinema_zoom, cfg.focus_index)
     if rc != 0:
         print(f"ffmpeg failed with code {rc}", file=sys.stderr)
         return rc

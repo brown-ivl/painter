@@ -248,16 +248,16 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
         c0 = fi % cols
         cx = c0 * cell_w + cell_w / 2.0
         cy = r0 * cell_h + cell_h / 2.0
-    mid = max(0.001, duration / 2.0)
-    # Expressions for animated crop size (even) and centered position clamped to frame
-    wtmp = f"{cell_w}+({out_w}-{cell_w})*min(1\,t/{mid})"
-    htmp = f"{cell_h}+({out_h}-{cell_h})*min(1\,t/{mid})"
-    wexpr = f"floor(({wtmp})/2)*2"
-    hexpr = f"floor(({htmp})/2)*2"
-    xexpr = f"max(0\,min({cx}-w/2\, iw-w))"
-    yexpr = f"max(0\,min({cy}-h/2\, ih-h))"
-    parts.append(f"{final_src}crop=w={wexpr}:h={hexpr}:x={xexpr}:y={yexpr},scale={out_w}:{out_h}[cz]")
-    final_src = "[cz]"
+        # Use zoompan for robust per-frame zoom instead of dynamic crop expressions
+        z0 = max(rows, cols)  # start fully on one cell or tighter (no other cells visible)
+        mid_frames = max(1, int(round(out_fps * duration / 2.0)))
+        zoom_expr = f"if(lte(on\\,{mid_frames})\\,{z0} - ({z0}-1)*on/{mid_frames}\\,1)"
+        x_expr = f"clamp({cx}-iw/zoom/2\\,0\\,iw-iw/zoom)"
+        y_expr = f"clamp({cy}-ih/zoom/2\\,0\\,ih-ih/zoom)"
+        parts.append(
+            f"{final_src}zoompan=z={zoom_expr}:x={x_expr}:y={y_expr}:d=1:s={out_w}x{out_h}[cz]"
+        )
+        final_src = "[cz]"
 
     # Optional downscale
     if max_width and out_w > max_width:

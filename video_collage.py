@@ -258,8 +258,8 @@ def make_filter_complex(meta_list: List[Dict[str, Any]], rows: int, cols: int, t
         x_expr = f"max(0\\,min({cx}-iw/zoom/2\\, iw-iw/zoom))"
         y_expr = f"max(0\\,min({cy}-ih/zoom/2\\, ih-ih/zoom))"
     parts.append(f"{final_src}zoompan=z={zoom_expr}:x={x_expr}:y={y_expr}:d=1:fps={out_fps}:s={out_w}x{out_h}[cz]")
-    # Enforce exact duration after zoompan (in case of frame rounding/drops)
-    parts.append(f"[cz]tpad=stop_mode=clone:stop_duration={duration},trim=duration={duration},setpts=PTS-STARTPTS[czt]")
+    # Normalize PTS and enforce exact duration
+    parts.append(f"[cz]setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={duration},trim=duration={duration},setpts=PTS-STARTPTS[czt]")
     final_src = "[czt]"
 
     # Optional downscale

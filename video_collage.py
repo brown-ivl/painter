@@ -332,8 +332,8 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
     all_videos = find_videos(args.inputs, recursive=args.recursive)
-    # Filter: only consider videos whose path contains the word "bric" (case-insensitive)
-    all_videos = [p for p in all_videos if "bric" in p.lower()]
+    # Filter: only consider videos whose filename contains the word "smartbric" (case-insensitive)
+    all_videos = [p for p in all_videos if "bric" in os.path.basename(p).lower()]
     if not all_videos:
         print("No videos found", file=sys.stderr)
         return 2
